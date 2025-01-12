@@ -136,7 +136,7 @@ export class ClientBase extends EventEmitter {
         );
     }
 
-    constructor(runtime: IAgentRuntime, twitterConfig:TwitterConfig) {
+    constructor(runtime: IAgentRuntime, twitterConfig: TwitterConfig) {
         super();
         this.runtime = runtime;
         this.twitterConfig = twitterConfig;
@@ -159,43 +159,46 @@ export class ClientBase extends EventEmitter {
         const username = this.twitterConfig.TWITTER_USERNAME;
         const password = this.twitterConfig.TWITTER_PASSWORD;
         const email = this.twitterConfig.TWITTER_EMAIL;
-        let retries = this.twitterConfig.TWITTER_RETRY_LIMIT
+        let retries = this.twitterConfig.TWITTER_RETRY_LIMIT;
         const twitter2faSecret = this.twitterConfig.TWITTER_2FA_SECRET;
+        const cookies = this.runtime.getSetting("TWITTER_COOKIES");
 
         if (!username) {
             throw new Error("Twitter username not configured");
         }
 
-        const cachedCookies = await this.getCachedCookies(username);
+        // Check for Twitter cookies
+        if (cookies) {
+            elizaLogger.debug("Using cookies from settings");
+            const cookiesArray = JSON.parse(cookies);
 
-        if (cachedCookies) {
-            elizaLogger.info("Using cached cookies");
-            await this.setCookiesFromArray(cachedCookies);
+            await this.setCookiesFromArray(cookiesArray);
+        } else {
+            elizaLogger.debug("No cookies found in settings");
+            elizaLogger.debug("Checking for cached cookies");
+            const cachedCookies = await this.getCachedCookies(username);
+            if (cachedCookies) {
+                await this.setCookiesFromArray(cachedCookies);
+            }
         }
 
         elizaLogger.log("Waiting for Twitter login");
         while (retries > 0) {
+            const cookies = await this.twitterClient.getCookies();
+            if ((await this.twitterClient.isLoggedIn()) && !!cookies) {
+                elizaLogger.info("Already logged in.");
+                await this.cacheCookies(username, cookies);
+                elizaLogger.info("Successfully logged in and cookies cached.");
+                break;
+            }
+
             try {
-                if (await this.twitterClient.isLoggedIn()) { // cookies are valid, no login required
-                    elizaLogger.info("Successfully logged in.");
-                    break;
-                } else {
-                    await this.twitterClient.login(
-                        username,
-                        password,
-                        email,
-                        twitter2faSecret
-                    );
-                    if (await this.twitterClient.isLoggedIn()) {  // fresh login, store new cookies
-                        elizaLogger.info("Successfully logged in.");
-                        elizaLogger.info("Caching cookies");
-                        await this.cacheCookies(
-                            username,
-                            await this.twitterClient.getCookies()
-                        );
-                        break;
-                    }
-                }
+                await this.twitterClient.login(
+                    username,
+                    password,
+                    email,
+                    twitter2faSecret
+                );
             } catch (error) {
                 elizaLogger.error(`Login attempt failed: ${error.message}`);
             }
@@ -251,7 +254,10 @@ export class ClientBase extends EventEmitter {
     /**
      * Fetch timeline for twitter account, optionally only from followed accounts
      */
-    async fetchHomeTimeline(count: number, following?: boolean): Promise<Tweet[]> {
+    async fetchHomeTimeline(
+        count: number,
+        following?: boolean
+    ): Promise<Tweet[]> {
         elizaLogger.debug("fetching home timeline");
         const homeTimeline = following
             ? await this.twitterClient.fetchFollowingTimeline(count, [])
@@ -288,13 +294,14 @@ export class ClientBase extends EventEmitter {
                     hashtags: tweet.hashtags ?? tweet.legacy?.entities.hashtags,
                     mentions:
                         tweet.mentions ?? tweet.legacy?.entities.user_mentions,
-                    photos: tweet.legacy?.entities?.media?.filter(
-                            (media) => media.type === "photo"
-                        ).map(media => ({
-                            id: media.id_str,
-                            url: media.media_url_https,  // Store media_url_https as url
-                            alt_text: media.alt_text
-                        })) || [],
+                    photos:
+                        tweet.legacy?.entities?.media
+                            ?.filter((media) => media.type === "photo")
+                            .map((media) => ({
+                                id: media.id_str,
+                                url: media.media_url_https, // Store media_url_https as url
+                                alt_text: media.alt_text,
+                            })) || [],
                     thread: tweet.thread || [],
                     urls: tweet.urls ?? tweet.legacy?.entities.urls,
                     videos:
@@ -314,38 +321,41 @@ export class ClientBase extends EventEmitter {
     async fetchTimelineForActions(count: number): Promise<Tweet[]> {
         elizaLogger.debug("fetching timeline for actions");
 
-        const agentUsername = this.twitterConfig.TWITTER_USERNAME
+        const agentUsername = this.twitterConfig.TWITTER_USERNAME;
         const homeTimeline = await this.twitterClient.fetchHomeTimeline(
             count,
             []
         );
 
-        return homeTimeline.map((tweet) => ({
-            id: tweet.rest_id,
-            name: tweet.core?.user_results?.result?.legacy?.name,
-            username: tweet.core?.user_results?.result?.legacy?.screen_name,
-            text: tweet.legacy?.full_text,
-            inReplyToStatusId: tweet.legacy?.in_reply_to_status_id_str,
-            timestamp: new Date(tweet.legacy?.created_at).getTime() / 1000,
-            userId: tweet.legacy?.user_id_str,
-            conversationId: tweet.legacy?.conversation_id_str,
-            permanentUrl: `https://twitter.com/${tweet.core?.user_results?.result?.legacy?.screen_name}/status/${tweet.rest_id}`,
-            hashtags: tweet.legacy?.entities?.hashtags || [],
-            mentions: tweet.legacy?.entities?.user_mentions || [],
-            photos: tweet.legacy?.entities?.media?.filter(
-                (media) => media.type === "photo"
-            ).map(media => ({
-                id: media.id_str,
-                url: media.media_url_https,  // Store media_url_https as url
-                alt_text: media.alt_text
-                 })) || [],
-            thread: tweet.thread || [],
-            urls: tweet.legacy?.entities?.urls || [],
-            videos:
-                tweet.legacy?.entities?.media?.filter(
-                    (media) => media.type === "video"
-                ) || [],
-        })).filter(tweet => tweet.username !== agentUsername); // do not perform action on self-tweets
+        return homeTimeline
+            .map((tweet) => ({
+                id: tweet.rest_id,
+                name: tweet.core?.user_results?.result?.legacy?.name,
+                username: tweet.core?.user_results?.result?.legacy?.screen_name,
+                text: tweet.legacy?.full_text,
+                inReplyToStatusId: tweet.legacy?.in_reply_to_status_id_str,
+                timestamp: new Date(tweet.legacy?.created_at).getTime() / 1000,
+                userId: tweet.legacy?.user_id_str,
+                conversationId: tweet.legacy?.conversation_id_str,
+                permanentUrl: `https://twitter.com/${tweet.core?.user_results?.result?.legacy?.screen_name}/status/${tweet.rest_id}`,
+                hashtags: tweet.legacy?.entities?.hashtags || [],
+                mentions: tweet.legacy?.entities?.user_mentions || [],
+                photos:
+                    tweet.legacy?.entities?.media
+                        ?.filter((media) => media.type === "photo")
+                        .map((media) => ({
+                            id: media.id_str,
+                            url: media.media_url_https, // Store media_url_https as url
+                            alt_text: media.alt_text,
+                        })) || [],
+                thread: tweet.thread || [],
+                urls: tweet.legacy?.entities?.urls || [],
+                videos:
+                    tweet.legacy?.entities?.media?.filter(
+                        (media) => media.type === "video"
+                    ) || [],
+            }))
+            .filter((tweet) => tweet.username !== agentUsername); // do not perform action on self-tweets
     }
 
     async fetchSearchTweets(
